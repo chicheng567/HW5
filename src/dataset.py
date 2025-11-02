@@ -233,7 +233,7 @@ def collate_fn(batch):
             images.append(image)
             instances = []
             for box, label in zip(boxes, labels):
-                target_instance = box.tolist()
+                target_instance = box
                 target_instance.append(int(label))
                 instances.append(target_instance)
             target_list.append(instances)

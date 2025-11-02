@@ -17,7 +17,7 @@ class BoxLoss(nn.Module):
         target_boxes = target_boxes.view(-1, num_anchors, 4)
         if self.type == 'giou':
             pxy = torch.sigmoid(pred_boxes[..., :2])  # Apply sigmoid to tx, ty
-            pwh = torch.exp(pred_boxes[..., 2:].clamp(max=1e3))  # Apply exp to tw, th
+            pwh = torch.exp(pred_boxes[..., 2:].clamp(max=10))  # Apply exp to tw, th, clamp to prevent overflow
             pwh = pwh * anchors  # Scale by anchors
             txy, twh = target_boxes[..., :2], target_boxes[..., 2:]
             # Find the smallest enclosing box
@@ -31,6 +31,7 @@ class BoxLoss(nn.Module):
             # 中心點都在同一個grid，所以不需要加上grid偏移，WH的時候會被消掉
             # 所有的面積都被 * grid_size^2 ，但是因為算比例所以也被抵消了
             c_area = (c_x2y2[..., 0] - c_x1y1[..., 0]) * (c_x2y2[..., 1] - c_x1y1[..., 1])
+            assert c_area[c_area <= 0].numel() == 0, "Enclosing box has non-positive area"     
             # iou
             eps = 1e-7
             # intersection
@@ -46,15 +47,20 @@ class BoxLoss(nn.Module):
             # union and IoU
             union = p_area + t_area - i_area
             iou = i_area / (union + eps)
-
             # GIoU and loss
             giou = iou - (c_area - union) / (c_area + eps)
             giou_loss = 1.0 - giou
+            if torch.isnan(giou_loss).sum() > 0:
+                torch.save(giou, 'giou.pt')
+                torch.save(iou, 'iou.pt')
+                torch.save(c_area, 'c_area.pt')
+                torch.save(union, 'union.pt')
+                raise ValueError("GIoU loss contains NaN values")
             return giou_loss.view(bsz, grid, grid, num_anchors)
         elif self.type == 'mse':
             mse_loss = F.mse_loss(pred_boxes, target_boxes, reduction='none')
             pxy = torch.sigmoid(pred_boxes[..., :2])  # Apply sigmoid to tx, ty
-            pwh = torch.exp(pred_boxes[..., 2:].clamp(max=1e3))  # Apply exp to tw, th
+            pwh = torch.exp(pred_boxes[..., 2:].clamp(max=10))  # Apply exp to tw, th, clamp to prevent overflow
             pwh = pwh * anchors  # Scale by anchors
             txy, twh = target_boxes[..., :2], target_boxes[..., 2:]
             mse_loss_xy = F.mse_loss(pxy, txy, reduction='none')
@@ -81,6 +87,8 @@ class YOLOv3Loss(nn.Module):
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
         self.box_loss = BoxLoss()
         self.anchors = anchors  # List of anchor boxes per scale
+    # Check for NaNs in any of the loss scalars and print which one is NaN
+    
     def forward(self, predictions, targets):
         """
         predictions: list of 3 scales, each [batch, grid, grid, 75]
@@ -120,6 +128,7 @@ class YOLOv3Loss(nn.Module):
                     gt[..., :4],
                     anchors
                 )
+                assert torch.isnan(box_loss).sum() == 0, "Box loss contains NaN values"
                 total_box_loss += box_loss[obj_mask].sum()
                 ################
                 # Class loss
@@ -135,7 +144,9 @@ class YOLOv3Loss(nn.Module):
                 gt[..., 4]
             )
             total_obj_loss += obj_loss_pos[obj_mask].sum()
+
             total_noobj_loss += obj_loss_pos[noobj_mask].sum()
+            
 
         # Box, obj, and cls losses are normalized by number of positive samples
         # NoObj loss is normalized by number of negative samples
