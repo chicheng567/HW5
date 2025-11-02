@@ -30,68 +30,102 @@ class BoxLoss(nn.Module):
     def __init__(self, loss_type='giou'):
         super(BoxLoss, self).__init__()
         self.type = loss_type
+
     def forward(self, pred_boxes, target_boxes, anchors):
         """
-        pred_boxes: [bsz, grid, grid, anchors, 4]
-        target_boxes: [bsz, grid, grid, anchors, 4]
-        anchors: list of (w, h) for the anchors at this scale
+        pred_boxes: [bsz, grid, grid, anchors, 4] (raw predictions)
+        target_boxes: [bsz, grid, grid, anchors, 4] (encoded targets)
+        anchors: list of (w, h) for the anchors at this scale (normalized 0-1)
         """
         bsz, grid, _, num_anchors, _ = pred_boxes.size()
-        anchors = torch.tensor(anchors, device=pred_boxes.device).unsqueeze(0)  # [1, 3, 2]
-        pred_boxes = pred_boxes.view(-1, num_anchors, 4)
-        target_boxes = target_boxes.view(-1, num_anchors, 4)
+        device = pred_boxes.device
+        dtype = pred_boxes.dtype
+
+        anchors = torch.tensor(anchors, device=device, dtype=dtype).view(1, 1, 1, num_anchors, 2)
+
+        # coordinate offset for each grid cell
+        grid_range = torch.arange(grid, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(grid_range, grid_range, indexing='ij')
+        grid_x = grid_x.view(1, grid, grid, 1, 1)
+        grid_y = grid_y.view(1, grid, grid, 1, 1)
+
         if self.type == 'giou':
-            pxy = torch.sigmoid(pred_boxes[..., :2])  # Apply sigmoid to tx, ty
-            pwh = torch.exp(pred_boxes[..., 2:].clamp(max=10))  # Apply exp to tw, th, clamp to prevent overflow
-            pwh = pwh * anchors  # Scale by anchors
-            txy, twh = target_boxes[..., :2], target_boxes[..., 2:]
-            # Find the smallest enclosing box
-            p_x1y1 = pxy - pwh / 2
-            p_x2y2 = pxy + pwh / 2
-            t_x1y1 = txy - twh / 2
-            t_x2y2 = txy + twh / 2
-            # enclosing box
-            c_x1y1 = torch.min(p_x1y1, t_x1y1)
-            c_x2y2 = torch.max(p_x2y2, t_x2y2)
-            # 中心點都在同一個grid，所以不需要加上grid偏移，WH的時候會被消掉
-            # 所有的面積都被 * grid_size^2 ，但是因為算比例所以也被抵消了
-            c_area = (c_x2y2[..., 0] - c_x1y1[..., 0]) * (c_x2y2[..., 1] - c_x1y1[..., 1])
-            assert c_area[c_area <= 0].numel() == 0, "Enclosing box has non-positive area"     
-            # iou
-            eps = 1e-7
-            # intersection
-            i_x1y1 = torch.max(p_x1y1, t_x1y1)
-            i_x2y2 = torch.min(p_x2y2, t_x2y2)
-            i_wh = (i_x2y2 - i_x1y1).clamp(min=0)
-            i_area = (i_wh[..., 0] * i_wh[..., 1])
+            # predicted centre (cell offset) and size
+            pxy = torch.sigmoid(pred_boxes[..., :2])
+            pwh = torch.exp(pred_boxes[..., 2:].clamp(min=-10, max=10)) * anchors
 
-            # areas
-            p_area = (pwh[..., 0] * pwh[..., 1])
-            t_area = (twh[..., 0] * twh[..., 1])
+            # target centre still stored as cell offset, convert to same system
+            txy = target_boxes[..., :2]
+            twh = target_boxes[..., 2:]
 
-            # union and IoU
+            # Convert both to image-normalised coordinates
+            pred_center_x = (pxy[..., 0].unsqueeze(-1) + grid_x) / grid
+            pred_center_y = (pxy[..., 1].unsqueeze(-1) + grid_y) / grid
+            targ_center_x = (txy[..., 0].unsqueeze(-1) + grid_x) / grid
+            targ_center_y = (txy[..., 1].unsqueeze(-1) + grid_y) / grid
+
+            # boxes to corner format
+            p_x1 = pred_center_x - pwh[..., 0].unsqueeze(-1) / 2
+            p_y1 = pred_center_y - pwh[..., 1].unsqueeze(-1) / 2
+            p_x2 = pred_center_x + pwh[..., 0].unsqueeze(-1) / 2
+            p_y2 = pred_center_y + pwh[..., 1].unsqueeze(-1) / 2
+
+            t_x1 = targ_center_x - twh[..., 0].unsqueeze(-1) / 2
+            t_y1 = targ_center_y - twh[..., 1].unsqueeze(-1) / 2
+            t_x2 = targ_center_x + twh[..., 0].unsqueeze(-1) / 2
+            t_y2 = targ_center_y + twh[..., 1].unsqueeze(-1) / 2
+
+            # Intersection box
+            i_x1 = torch.max(p_x1, t_x1)
+            i_y1 = torch.max(p_y1, t_y1)
+            i_x2 = torch.min(p_x2, t_x2)
+            i_y2 = torch.min(p_y2, t_y2)
+            i_w = (i_x2 - i_x1).clamp(min=0)
+            i_h = (i_y2 - i_y1).clamp(min=0)
+            i_area = i_w * i_h
+
+            # Areas
+            p_area = ((p_x2 - p_x1).clamp(min=0) * (p_y2 - p_y1).clamp(min=0))
+            t_area = ((t_x2 - t_x1).clamp(min=0) * (t_y2 - t_y1).clamp(min=0))
+
             union = p_area + t_area - i_area
+            eps = 1e-7
             iou = i_area / (union + eps)
-            # GIoU and loss
+
+            # smallest enclosing box
+            c_x1 = torch.min(p_x1, t_x1)
+            c_y1 = torch.min(p_y1, t_y1)
+            c_x2 = torch.max(p_x2, t_x2)
+            c_y2 = torch.max(p_y2, t_y2)
+            c_w = (c_x2 - c_x1).clamp(min=eps)
+            c_h = (c_y2 - c_y1).clamp(min=eps)
+            c_area = c_w * c_h
+
             giou = iou - (c_area - union) / (c_area + eps)
             giou_loss = 1.0 - giou
-            return giou_loss.view(bsz, grid, grid, num_anchors)
+            return giou_loss.squeeze(-1)
+
         elif self.type == 'mse':
-            pxy = torch.sigmoid(pred_boxes[..., :2])  # Apply sigmoid to tx, ty
-            pwh = torch.exp(pred_boxes[..., 2:].clamp(max=10))  # Apply exp to tw, th, clamp to prevent overflow
-            pwh = pwh * anchors  # Scale by anchors
+            pxy = torch.sigmoid(pred_boxes[..., :2])
+            pwh = torch.exp(pred_boxes[..., 2:].clamp(min=-10, max=10)) * anchors
             txy, twh = target_boxes[..., :2], target_boxes[..., 2:]
-            mse_loss_xy = F.mse_loss(pxy, txy, reduction='none').sum(-1)
+
+            pred_center = torch.stack([(pxy[..., 0] + grid_x.squeeze(-1)) / grid,
+                                       (pxy[..., 1] + grid_y.squeeze(-1)) / grid], dim=-1)
+            targ_center = torch.stack([(txy[..., 0] + grid_x.squeeze(-1)) / grid,
+                                       (txy[..., 1] + grid_y.squeeze(-1)) / grid], dim=-1)
+
+            mse_loss_xy = F.mse_loss(pred_center, targ_center, reduction='none').sum(-1)
             mse_loss_wh = F.mse_loss(pwh, twh, reduction='none').sum(-1)
-            return (mse_loss_xy + mse_loss_wh).view(bsz, grid, grid, num_anchors)
+            return mse_loss_xy + mse_loss_wh
         else:
             raise NotImplementedError(f"Box loss type '{self.type}' not implemented.")
 class YOLOv3Loss(nn.Module):
     def __init__(
         self,
-        lambda_coord=5.0,
+        lambda_coord=2.0,
         lambda_obj=1.0,
-        lambda_noobj=0.5,
+        lambda_noobj=0.2,
         lambda_class=1.0,
         anchors=None,
     ):
@@ -104,7 +138,7 @@ class YOLOv3Loss(nn.Module):
         self.mse_loss = nn.MSELoss(reduction='none')
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
         self.focal_loss = FocalLoss(reduction='none')
-        self.box_loss = BoxLoss(loss_type='mse')
+        self.box_loss = BoxLoss(loss_type='giou')
         self.anchors = anchors  # List of anchor boxes per scale
     # Check for NaNs in any of the loss scalars and print which one is NaN
     
@@ -116,8 +150,8 @@ class YOLOv3Loss(nn.Module):
         device = predictions[0].device
 
         total_box_loss = torch.tensor(0.0, device=device)
-        total_obj_loss = torch.tensor(0.0, device=device)
-        total_noobj_loss = torch.tensor(0.0, device=device)
+        total_obj_loss_pos = torch.tensor(0.0, device=device)
+        total_obj_loss_neg = torch.tensor(0.0, device=device)
         total_cls_loss = torch.tensor(0.0, device=device)
 
         total_num_pos = 0
@@ -158,22 +192,20 @@ class YOLOv3Loss(nn.Module):
                 total_cls_loss += cls_loss[obj_mask].sum()
 
             # Objectness loss for positive samples
-            obj_loss_pos = self.focal_loss(
+            obj_loss = self.focal_loss(
                 pred[..., 4],
                 gt[..., 4]
             )
-            total_obj_loss += obj_loss_pos[obj_mask].sum()
+            total_obj_loss_pos += obj_loss[obj_mask].sum()
+            total_obj_loss_neg += obj_loss[noobj_mask].sum()
 
-            total_noobj_loss += obj_loss_pos[noobj_mask].sum()
-            
+        pos_denom = max(total_num_pos, 1)
+        neg_denom = max(total_num_neg, 1)
 
-        # Box, obj, and cls losses are normalized by number of positive samples
-        # NoObj loss is normalized by number of negative samples
-        total_box_loss = total_box_loss / batch_size
-        total_obj_loss = total_obj_loss / batch_size
-        total_cls_loss = total_cls_loss / batch_size
-
-        total_noobj_loss = total_noobj_loss / batch_size
+        total_box_loss = total_box_loss / pos_denom
+        total_obj_loss = total_obj_loss_pos / pos_denom
+        total_cls_loss = total_cls_loss / pos_denom
+        total_noobj_loss = total_obj_loss_neg / neg_denom
 
         # Combined loss
         

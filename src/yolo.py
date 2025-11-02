@@ -185,11 +185,9 @@ def non_max_suppression(prediction, conf_thres=0.3, nms_thres=0.4):
         boxes_xyxy[:, 3] = image_pred[:, 1] + image_pred[:, 3] / 2  # y2
 
         # Scores for NMS (combined objectness * class confidence)
-        scores = obj_conf * class_conf.squeeze()
-
+        scores = obj_conf * class_conf.squeeze(-1)
         # Class labels
-        labels = class_pred.squeeze()
-
+        labels = class_pred.squeeze(-1)
         # Apply batched NMS (GPU-accelerated, handles multiple classes)
         keep_indices = batched_nms(boxes_xyxy, scores, labels, nms_thres)
 

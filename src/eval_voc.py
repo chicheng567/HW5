@@ -77,6 +77,10 @@ def voc_eval(
         for (key1, key2) in target:
             if key2 == class_:
                 npos += len(target[(key1, key2)])
+        if npos == 0:
+            print(f"---class {class_} ap 0.0--- (no ground truth instances)")
+            aps += [0.0]
+            continue
         nd = len(image_ids)
         tp = np.zeros(nd)
         fp = np.zeros(nd)
