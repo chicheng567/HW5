@@ -166,13 +166,12 @@ def evaluate(model, eval_loader):
 
             # Build ground truth from target_list
             # target_list[i] is a list of instances: [[x1,y1,x2,y2,label], ...]
-            # Note: boxes are normalized (0-1), need to convert to pixels
+            # Note: boxes are already in pixel coordinates (0-416) after albumentations transform
             for instance in target_list[i]:
-                box_norm = instance[:4]  # [x1, y1, x2, y2] normalized
+                box_pixels = instance[:4]  # [x1, y1, x2, y2] in pixels (0-416)
                 label = int(instance[4])
                 class_name = VOC_CLASSES[label]
-                # Convert normalized coords to pixel coords
-                box_pixels = [coord * YOLO_IMG_DIM for coord in box_norm]
+                # Boxes are already in pixel coordinates, no need to scale
                 targets[(image_id, class_name)].append(box_pixels)
 
             # Get image dimensions (all images are resized to YOLO_IMG_DIM)

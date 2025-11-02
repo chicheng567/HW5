@@ -18,11 +18,11 @@ def train():
     # Hyperparameters
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     num_epochs = 50
-    batch_size = 35
+    batch_size = 50
     learning_rate = 1e-3
     lambda_coord=5.0
     lambda_obj=1.0
-    lambda_noobj=0.1  # Reduced from 0.5 to prevent too many false positives
+    lambda_noobj=0.5
     lambda_class=1.0
     # Data paths
     file_root_train = './VOC/JPEGImages/'

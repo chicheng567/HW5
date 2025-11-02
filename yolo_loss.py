@@ -1,6 +1,31 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='none'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        inputs: predictions after sigmoid, shape [N, *]
+        targets: ground truth labels (0 or 1), shape [N, *]
+        """
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        probs = torch.sigmoid(inputs)
+        p_t = targets * probs + (1 - targets) * (1 - probs)
+        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+        focal_loss = alpha_t * (1 - p_t) ** self.gamma * bce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+        
 class BoxLoss(nn.Module):
     def __init__(self, loss_type='giou'):
         super(BoxLoss, self).__init__()
@@ -85,6 +110,7 @@ class YOLOv3Loss(nn.Module):
 
         self.mse_loss = nn.MSELoss(reduction='none')
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.focal_loss = FocalLoss(reduction='none')
         self.box_loss = BoxLoss()
         self.anchors = anchors  # List of anchor boxes per scale
     # Check for NaNs in any of the loss scalars and print which one is NaN
@@ -139,7 +165,7 @@ class YOLOv3Loss(nn.Module):
                 total_cls_loss += cls_loss[obj_mask].sum()
 
             # Objectness loss for positive samples
-            obj_loss_pos = self.bce_loss(
+            obj_loss_pos = self.focal_loss(
                 pred[..., 4],
                 gt[..., 4]
             )
