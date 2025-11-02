@@ -6,17 +6,17 @@ import torch.utils.data as DataLoader
 import albumentations as A
 from src.config import VOC_IMG_MEAN, VOC_IMG_STD, YOLO_IMG_DIM, ANCHORS, GRID_SIZES
 train_data_pipelines = A.Compose([
-    A.RandomSizedBBoxSafeCrop(
-        width=YOLO_IMG_DIM, 
-        height=YOLO_IMG_DIM, 
-        erosion_rate=0,
-        p=0.3
-    ),
+    # A.RandomSizedBBoxSafeCrop(
+    #     width=YOLO_IMG_DIM, 
+    #     height=YOLO_IMG_DIM, 
+    #     erosion_rate=0,
+    #     p=0.3
+    # ),
     A.Resize(YOLO_IMG_DIM, YOLO_IMG_DIM),
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.1),
-    A.Rotate(limit=10, p=0.3, border_mode=cv2.BORDER_CONSTANT),
-    A.RandomBrightnessContrast(p=0.2),
+    # A.Rotate(limit=10, p=0.3, border_mode=cv2.BORDER_CONSTANT),
+    # A.RandomBrightnessContrast(p=0.2),
     A.Normalize(mean=VOC_IMG_MEAN, std=VOC_IMG_STD),
     A.pytorch.ToTensorV2(),
 ], bbox_params=A.BboxParams(

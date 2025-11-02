@@ -8,7 +8,6 @@ from collections import defaultdict
 
 from src.config import VOC_CLASSES, VOC_IMG_MEAN, VOC_IMG_STD, YOLO_IMG_DIM
 import albumentations as A
-from src.dataset import test_data_pipelines
 
 # https://github.com/rbgirshick/py-faster-rcnn/blob/master/lib/datasets/voc_eval.py
 def voc_ap(rec, prec, use_07_metric=False):
@@ -152,12 +151,8 @@ def evaluate(model, eval_loader):
     for images, target_list in tqdm(eval_loader):
         # Move to GPU if available
         images = images.to(device)
-
-        # Run inference with LOW threshold for evaluation
-        # Using low conf_thres (0.01) allows model to propose more candidates
-        # The mAP metric will properly evaluate them
         with torch.no_grad():
-            detections = model.inference(images, conf_thres=0.01, nms_thres=0.4)
+            detections = model.inference(images, conf_thres=0.3, nms_thres=0.4)
 
         # Process each image in the batch
         for i in range(len(images)):

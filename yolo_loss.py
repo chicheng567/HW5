@@ -75,21 +75,14 @@ class BoxLoss(nn.Module):
             # GIoU and loss
             giou = iou - (c_area - union) / (c_area + eps)
             giou_loss = 1.0 - giou
-            if torch.isnan(giou_loss).sum() > 0:
-                torch.save(giou, 'giou.pt')
-                torch.save(iou, 'iou.pt')
-                torch.save(c_area, 'c_area.pt')
-                torch.save(union, 'union.pt')
-                raise ValueError("GIoU loss contains NaN values")
             return giou_loss.view(bsz, grid, grid, num_anchors)
         elif self.type == 'mse':
-            mse_loss = F.mse_loss(pred_boxes, target_boxes, reduction='none')
             pxy = torch.sigmoid(pred_boxes[..., :2])  # Apply sigmoid to tx, ty
             pwh = torch.exp(pred_boxes[..., 2:].clamp(max=10))  # Apply exp to tw, th, clamp to prevent overflow
             pwh = pwh * anchors  # Scale by anchors
             txy, twh = target_boxes[..., :2], target_boxes[..., 2:]
-            mse_loss_xy = F.mse_loss(pxy, txy, reduction='none')
-            mse_loss_wh = F.mse_loss(pwh, twh, reduction='none')
+            mse_loss_xy = F.mse_loss(pxy, txy, reduction='none').sum(-1)
+            mse_loss_wh = F.mse_loss(pwh, twh, reduction='none').sum(-1)
             return (mse_loss_xy + mse_loss_wh).view(bsz, grid, grid, num_anchors)
         else:
             raise NotImplementedError(f"Box loss type '{self.type}' not implemented.")
@@ -111,7 +104,7 @@ class YOLOv3Loss(nn.Module):
         self.mse_loss = nn.MSELoss(reduction='none')
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
         self.focal_loss = FocalLoss(reduction='none')
-        self.box_loss = BoxLoss()
+        self.box_loss = BoxLoss(loss_type='mse')
         self.anchors = anchors  # List of anchor boxes per scale
     # Check for NaNs in any of the loss scalars and print which one is NaN
     
