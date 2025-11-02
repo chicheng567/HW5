@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
+from torch.amp import autocast, GradScaler
 from src.yolo import resnet50
 from yolo_loss import YOLOv3Loss
 from src.dataset import VocDetectorDataset, train_data_pipelines, test_data_pipelines, collate_fn
@@ -18,7 +19,7 @@ def train():
     # Hyperparameters
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     num_epochs = 50
-    batch_size = 50
+    batch_size = 80
     learning_rate = 1e-3
     lambda_coord=5.0
     lambda_obj=1.0
@@ -91,6 +92,8 @@ def train():
     criterion = YOLOv3Loss(lambda_coord, lambda_obj, lambda_noobj, lambda_class, ANCHORS).to(device)
     optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=5e-4)
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    use_amp = torch.cuda.is_available()
+    scaler = GradScaler(enabled=use_amp)
     # Training loop
     print('\nStarting training...')
     torch.cuda.empty_cache()
@@ -103,13 +106,15 @@ def train():
             images = images.to(device)
             target = [t.to(device) for t in target]
             # Forward pass
-            pred = net(images)
-            # pred and target are lists of each scales
-            loss_dict = criterion(pred, target)
-            # Backward pass
             optimizer.zero_grad()
-            loss_dict['total'].backward()
-            optimizer.step()
+            with autocast("cuda", enabled=use_amp):
+                pred = net(images)
+                # pred and target are lists of each scales
+                loss_dict = criterion(pred, target)
+            # Backward pass with mixed precision support
+            scaler.scale(loss_dict['total']).backward()
+            scaler.step(optimizer)
+            scaler.update()
             # Print progress
             if i % 50 == 0:
                 outstring = f'Epoch [{epoch+1}/{num_epochs}], Iter [{i+1}/{len(train_loader)}], Loss: '
