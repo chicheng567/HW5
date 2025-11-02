@@ -10,12 +10,12 @@ train_data_pipelines = A.Compose([
         width=YOLO_IMG_DIM, 
         height=YOLO_IMG_DIM, 
         erosion_rate=0,
-        p=0.5
+        p=0.3
     ),
     A.Resize(YOLO_IMG_DIM, YOLO_IMG_DIM),
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.1),
-    A.Rotate(limit=15, p=0.3, border_mode=cv2.BORDER_CONSTANT),
+    A.Rotate(limit=10, p=0.3, border_mode=cv2.BORDER_CONSTANT),
     A.RandomBrightnessContrast(p=0.2),
     A.Normalize(mean=VOC_IMG_MEAN, std=VOC_IMG_STD),
     A.pytorch.ToTensorV2(),
@@ -23,6 +23,7 @@ train_data_pipelines = A.Compose([
     format='pascal_voc',
     label_fields=['cls_labels']
 ))
+
 test_data_pipelines = A.Compose([
     A.Resize(height=YOLO_IMG_DIM, width=YOLO_IMG_DIM),
     A.Normalize(mean=VOC_IMG_MEAN, std=VOC_IMG_STD),
@@ -89,8 +90,21 @@ class VocDetectorDataset(DataLoader.Dataset):
         union = w1 * h1 + w2 * h2 - intersection
         iou = intersection / (union + 1e-16)
         return iou.item()
-    
-    def encoder(self, boxes:list, labels:list):
+    def from_cxcy_to_gridxy(self, cx, cy, grid_size, image_size):
+        """
+        Convert center coordinates (cx, cy) to grid cell coordinates (grid_x, grid_y)
+        and normalized coordinates (tx, ty) within the grid cell.
+        """
+        stride_x = image_size[0] / grid_size
+        stride_y = image_size[1] / grid_size
+        grid_x, tx = divmod(cx, stride_x)
+        grid_y, ty = divmod(cy, stride_y)
+        grid_x = int(grid_x)
+        grid_y = int(grid_y)
+        tx, ty = tx / stride_x, ty / stride_y #normalize tx, ty to [0, 1]
+        return grid_x, grid_y, tx, ty
+
+    def encoder(self, image, boxes:list, labels:list):
         """
         Encode ground truth boxes and labels into YOLO target format.
         
@@ -106,55 +120,48 @@ class VocDetectorDataset(DataLoader.Dataset):
             target_obj: List of 3 tensors, shape [grid_size, grid_size, 3]
                     Objectness mask (1 if object present, 0 otherwise)
         """
-        S = [YOLO_IMG_DIM // gs for gs in self.grid_sizes]
-        num_scales = len(S)
+        num_scales = len(self.grid_sizes)
+        image_height, image_width = image.shape[1], image.shape[2]
         # Initialize target tensors
         target_boxes = [torch.zeros(gs, gs, 3, 4) for gs in self.grid_sizes]
         target_cls = [torch.zeros(gs, gs, 3, self.num_classes) for gs in self.grid_sizes]
         target_obj = [torch.zeros(gs, gs, 3) for gs in self.grid_sizes]
         anchors = torch.tensor(ANCHORS)  # Shape: [3, 3, 2]
         assert len(boxes) == len(labels), "Mismatch between boxes and labels length"
-        best_idxs = []
         for box, label in zip(boxes, labels):
             # Convert box to center format
-            x1, y1, x2, y2 = box
+            x1, y1, x2, y2 = box # haven't normalized yet!!!!!!
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
-            w = x2 - x1
-            h = y2 - y1
+            w = (x2 - x1) / image_width #normalize w to [0, 1]
+            h = (y2 - y1) / image_height #normalize h to [0, 1]
+            assert 0 < w <= 1.0 and 0 < h <= 1.0, f"Box width and height must be in (0, 1]. Got w: {w}, h: {h}"
             #find best anchor
             best_iou = -1
-            best_scale_idx = 0
-            best_anchor_idx = 0
-            #find grid cell
-            grid_size = self.grid_sizes[best_scale_idx]
-            grid_x = int(cx * grid_size)
-            grid_y = int(cy * grid_size)
-            # Ensure indices are within bounds
-            grid_x = min(grid_x, grid_size - 1)
-            grid_y = min(grid_y, grid_size - 1)
-            # Compute offsets relative to grid cell (0 to 1)
-            # What actually model predicts
-            tx = cx * grid_size - grid_x
-            ty = cy * grid_size - grid_y
+            best_scale_idx = None
+            best_anchor_idx = None
             for scale_idx in range(num_scales):
+                grid_size = self.grid_sizes[scale_idx]
+                grid_x, grid_y, tx, ty = self.from_cxcy_to_gridxy(cx, cy, grid_size, (image_width, image_height))
                 for anchor_idx in range(anchors.shape[1]):
                     anchor_w, anchor_h = anchors[scale_idx, anchor_idx]
                     iou = self._compute_iou_wh(w, h, anchor_w, anchor_h)
+                    # Check if this anchor is better and not already occupied
                     if iou > best_iou and target_obj[scale_idx][grid_y, grid_x, anchor_idx] == 0:
                         best_iou = iou
                         best_scale_idx = scale_idx
                         best_anchor_idx = anchor_idx
-            # Compute width and height relative to anchor
-            anchor_w, anchor_h = anchors[best_scale_idx][best_anchor_idx]
-            tw = torch.log(torch.clamp(w / anchor_w, min=1e-16))
-            th = torch.log(torch.clamp(h / anchor_h, min=1e-16))
+        
+            assert best_scale_idx is not None, "No suitable anchor found for box."
+            
             # Encode target
-            target_boxes[best_scale_idx][grid_y, grid_x, best_anchor_idx] = torch.tensor([tx, ty, tw, th])
+            grid_size = self.grid_sizes[best_scale_idx]
+            grid_x, grid_y, tx, ty = self.from_cxcy_to_gridxy(cx, cy, grid_size, (image_width, image_height))
+            target_boxes[best_scale_idx][grid_y, grid_x, best_anchor_idx] = torch.tensor([tx, ty, w, h]) # Store absolute cx, cy, w, h for loss calculation
             target_cls[best_scale_idx][grid_y, grid_x, best_anchor_idx, int(label)] = 1.0
             target_obj[best_scale_idx][grid_y, grid_x, best_anchor_idx] = 1.0 # There is an object
-            best_idxs.append((best_scale_idx, best_anchor_idx))
-        
+
+
         # Combine targets into a single structure
         assert len(boxes) == sum([target_obj[scale].sum() for scale in range(num_scales)]), f"Some boxes were not assigned to any scale.{len(boxes)} vs {[target_obj[scale].sum() for scale in range(num_scales)]}, best idxs: {best_idxs}"
         obj_mask = sum(obj_mask.sum() for obj_mask in target_obj)
@@ -172,20 +179,32 @@ class VocDetectorDataset(DataLoader.Dataset):
             transformed = self.transform(image=img)
             transformed_image = transformed['image']
             return (transformed_image,)
-        boxes = self.boxes[idx] #list
-        labels = self.labels[idx] #list
-        transformed = self.transform(
-            image=img, bboxes=boxes, cls_labels=labels
-        )
-        transformed_image = transformed['image']
-        transformed_bboxes = np.array(transformed['bboxes'])
-        transformed_bboxes = [boxes / YOLO_IMG_DIM for boxes in transformed_bboxes]
-        transformed_labels = transformed['cls_labels']
-        assert len(transformed_bboxes) == len(transformed_labels), "Mismatch between boxes and labels after transformation"
-        assert len(transformed_bboxes) > 0, "No bounding boxes after transformation"
+        try:
+            boxes = self.boxes[idx] #list
+            labels = self.labels[idx] #list
+            transformed = self.transform(
+                image=img, bboxes=boxes, cls_labels=labels
+            )
+            transformed_image = transformed['image']
+            transformed_bboxes = transformed['bboxes']
+            transformed_labels = transformed['cls_labels']
+            assert len(transformed_bboxes) == len(transformed_labels), "Mismatch between boxes and labels after transformation"
+            assert len(transformed_bboxes) > 0, "No bounding boxes after transformation"
+        except Exception as e:
+            print(f"Error processing index {idx}, file {fname}: {e}")
+            print("Using fallback: No augmentation.")
+            boxes = self.boxes[idx] #list
+            labels = self.labels[idx] #list
+            transformed = test_data_pipelines(
+                image=img, bboxes=boxes, cls_labels=labels
+            )
+            transformed_image = transformed['image']
+            transformed_bboxes = transformed['bboxes']
+            transformed_labels = transformed['cls_labels']
+
         if self.encode_target and len(transformed_bboxes) > 0:
             target = self.encoder(
-                transformed_bboxes, transformed_labels
+                transformed_image,  transformed_bboxes, transformed_labels
             )
             return transformed_image, target
         else:
@@ -214,7 +233,8 @@ def collate_fn(batch):
             images.append(image)
             instances = []
             for box, label in zip(boxes, labels):
-                target_instance = box.tolist().append(label)
+                target_instance = box.tolist()
+                target_instance.append(int(label))
                 instances.append(target_instance)
             target_list.append(instances)
         images = torch.stack(images, dim=0)

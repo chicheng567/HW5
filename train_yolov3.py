@@ -12,18 +12,17 @@ from src.yolo import resnet50
 from yolo_loss import YOLOv3Loss
 from src.dataset import VocDetectorDataset, train_data_pipelines, test_data_pipelines, collate_fn
 from src.eval_voc import evaluate
-from src.config import GRID_SIZES
-
+from src.config import GRID_SIZES, ANCHORS
+from torch.optim.lr_scheduler import CosineAnnealingLR
 def train():
     # Hyperparameters
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     num_epochs = 50
     batch_size = 35
     learning_rate = 1e-3
-    # Loss coefficients
     lambda_coord=5.0
     lambda_obj=1.0
-    lambda_noobj=0.5
+    lambda_noobj=0.1  # Reduced from 0.5 to prevent too many false positives
     lambda_class=1.0
     # Data paths
     file_root_train = './VOC/JPEGImages/'
@@ -89,24 +88,16 @@ def train():
     print(f'Model parameters: {sum(p.numel() for p in net.parameters()):,}')
 
     # Create loss and optimizer
-    criterion = YOLOv3Loss(lambda_coord, lambda_obj, lambda_noobj, lambda_class).to(device)
+    criterion = YOLOv3Loss(lambda_coord, lambda_obj, lambda_noobj, lambda_class, ANCHORS).to(device)
     optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=5e-4)
+    lr_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     # Training loop
     print('\nStarting training...')
     torch.cuda.empty_cache()
     best_val_loss = np.inf
     for epoch in range(num_epochs):
         net.train()
-        # Update learning rate late in training
-        if epoch == 30 or epoch == 40:
-            learning_rate /= 10.0
-
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = learning_rate
-
         print(f'\n\nStarting epoch {epoch + 1} / {num_epochs}')
-        print(f'Learning Rate for this epoch: {learning_rate}')
-
         for i, (images, target) in enumerate(train_loader):
             # Move to device
             images = images.to(device)
@@ -115,18 +106,18 @@ def train():
             pred = net(images)
             # pred and target are lists of each scales
             loss_dict = criterion(pred, target)
-
             # Backward pass
             optimizer.zero_grad()
             loss_dict['total'].backward()
             optimizer.step()
-
             # Print progress
-            if (i + 1) % 50 == 0:
+            if i % 50 == 0:
                 outstring = f'Epoch [{epoch+1}/{num_epochs}], Iter [{i+1}/{len(train_loader)}], Loss: '
-                outstring += ', '.join(f"{key}={val / (i+1):.3f}" for key, val in loss_dict.items())
+                outstring += ', '.join(f"{key}={val :.3f}" for key, val in loss_dict.items())
                 print(outstring)
-
+        lr_scheduler.step()
+        learning_rate = lr_scheduler.get_last_lr()[0]
+        print(f'Learning Rate for this epoch: {learning_rate}')
         # Validation
         with torch.no_grad():
             val_loss = 0.0
@@ -159,7 +150,7 @@ def train():
         # Evaluate on val set
         if (epoch + 1) % 5 == 0:
             print('\nEvaluating on validation set...')
-            val_aps = evaluate(net, val_dataset_file=annotation_file_val, img_root=file_root_val)
+            val_aps = evaluate(net, eval_loader)
             print(f'Epoch {epoch}, mAP: {np.mean(val_aps):.4f}')
 
 

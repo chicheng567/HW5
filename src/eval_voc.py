@@ -1,12 +1,14 @@
 import sys
+import os
+import cv2
 import torch
 import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 
-from src.predict import *
-
-from src.config import VOC_CLASSES
+from src.config import VOC_CLASSES, VOC_IMG_MEAN, VOC_IMG_STD, YOLO_IMG_DIM
+import albumentations as A
+from src.dataset import test_data_pipelines
 
 # https://github.com/rbgirshick/py-faster-rcnn/blob/master/lib/datasets/voc_eval.py
 def voc_ap(rec, prec, use_07_metric=False):
@@ -125,56 +127,124 @@ def voc_eval(
     return aps
 
 
-def evaluate(model, val_dataset_file, img_root, val_loader=None):
-    targets = defaultdict(list)
-    preds = defaultdict(list)
-    image_list = []  # image path list
+def evaluate(model, eval_loader):
+    """
+    Evaluate model using DataLoader with built-in inference method.
 
-    f = open(val_dataset_file)
-    lines = f.readlines()
-    file_list = []
-    for line in lines:
-        splited = line.strip().split()
-        file_list.append(splited)
-    f.close()
+    Args:
+        model: ODModel instance with inference() method
+        eval_loader: DataLoader with encode_target=False
 
-    # Collect target predictions for test set
-    for index, image_file in enumerate(file_list):
-        image_id = image_file[0]
+    Returns:
+        aps: List of average precision scores per class
+    """
 
-        image_list.append(image_id)
-        num_obj = (len(image_file) - 1) // 5
-        for i in range(num_obj):
-            x1 = int(image_file[1 + 5 * i])
-            y1 = int(image_file[2 + 5 * i])
-            x2 = int(image_file[3 + 5 * i])
-            y2 = int(image_file[4 + 5 * i])
-            c = int(image_file[5 + 5 * i])
-            class_name = VOC_CLASSES[c]
-            targets[(image_id, class_name)].append([x1, y1, x2, y2])
-
-    print("---Evaluate model on test samples---")
+    print("---Evaluate model on validation samples---")
     sys.stdout.flush()
     model.eval()
-    for image_path in tqdm(image_list):
-        result = predict_image(model, image_path, root_img_directory=img_root)
-        for (
-            (x1, y1),
-            (x2, y2),
-            class_name,
-            image_id,
-            prob,
-        ) in result:  # image_id is actually image_path
-            preds[class_name].append([image_id, prob, x1, y1, x2, y2])
+    targets = defaultdict(list)
+    preds = defaultdict(list)
+
+    device = next(model.parameters()).device
+
+    # Run inference on all batches
+    global_idx = 0
+    for images, target_list in tqdm(eval_loader):
+        # Move to GPU if available
+        images = images.to(device)
+
+        # Run inference with LOW threshold for evaluation
+        # Using low conf_thres (0.01) allows model to propose more candidates
+        # The mAP metric will properly evaluate them
+        with torch.no_grad():
+            detections = model.inference(images, conf_thres=0.01, nms_thres=0.4)
+
+        # Process each image in the batch
+        for i in range(len(images)):
+            # Use global index as unique image_id
+            image_id = global_idx + i
+
+            # Build ground truth from target_list
+            # target_list[i] is a list of instances: [[x1,y1,x2,y2,label], ...]
+            # Note: boxes are normalized (0-1), need to convert to pixels
+            for instance in target_list[i]:
+                box_norm = instance[:4]  # [x1, y1, x2, y2] normalized
+                label = int(instance[4])
+                class_name = VOC_CLASSES[label]
+                # Convert normalized coords to pixel coords
+                box_pixels = [coord * YOLO_IMG_DIM for coord in box_norm]
+                targets[(image_id, class_name)].append(box_pixels)
+
+            # Get image dimensions (all images are resized to YOLO_IMG_DIM)
+            # We need original dimensions to convert normalized coords back
+            # Since we don't have access to original dims, we'll use YOLO_IMG_DIM
+            # Note: This assumes target_list contains boxes in pixel coordinates at YOLO_IMG_DIM
+            img_dim = YOLO_IMG_DIM
+
+            # Process detections for this image
+            if detections[i] is not None:
+                for detection in detections[i]:
+                    # Detection format: (x, y, w, h, obj_conf, class_conf, class_pred)
+                    x_center = detection[0].item()
+                    y_center = detection[1].item()
+                    w = detection[2].item()
+                    h = detection[3].item()
+                    obj_conf = detection[4].item()
+                    class_conf = detection[5].item()
+                    class_id = int(detection[6].item())
+
+                    # Convert from center format (normalized 0-1) to corner format (pixels)
+                    x1 = int((x_center - w / 2) * img_dim)
+                    y1 = int((y_center - h / 2) * img_dim)
+                    x2 = int((x_center + w / 2) * img_dim)
+                    y2 = int((y_center + h / 2) * img_dim)
+
+                    # Clip to image boundaries
+                    x1 = max(0, min(x1, img_dim - 1))
+                    y1 = max(0, min(y1, img_dim - 1))
+                    x2 = max(0, min(x2, img_dim - 1))
+                    y2 = max(0, min(y2, img_dim - 1))
+
+                    # Skip degenerate boxes
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    # Combined confidence score
+                    prob = obj_conf * class_conf
+                    class_name = VOC_CLASSES[class_id]
+
+                    # Add to predictions
+                    preds[class_name].append([image_id, prob, x1, y1, x2, y2])
+
+        global_idx += len(images)
 
     aps = voc_eval(preds, targets, VOC_CLASSES=VOC_CLASSES)
     return aps
 
 def test_evaluate(model, test_dataset_file, img_root, test_loader=None):
+    """
+    Evaluate model on test set using built-in inference method.
+
+    Args:
+        model: ODModel instance with inference() method
+        test_dataset_file: Path to test annotation file
+        img_root: Root directory containing images
+        test_loader: Optional (not used, kept for backward compatibility)
+
+    Returns:
+        preds_submission: Dictionary mapping image_id to list of detections
+    """
     targets = defaultdict(list)
     preds = defaultdict(list)
     preds_submission = defaultdict(list)
     image_list = []  # image path list
+
+    # Preprocessing transform (same as test_data_pipelines)
+    transform = A.Compose([
+        A.Resize(height=YOLO_IMG_DIM, width=YOLO_IMG_DIM),
+        A.Normalize(mean=VOC_IMG_MEAN, std=VOC_IMG_STD),
+        A.pytorch.ToTensorV2(),
+    ])
 
     f = open(test_dataset_file)
     lines = f.readlines()
@@ -184,10 +254,9 @@ def test_evaluate(model, test_dataset_file, img_root, test_loader=None):
         file_list.append(splited)
     f.close()
 
-    # Collect target predictions for test set
-    for index, image_file in enumerate(file_list):
+    # Collect ground truth targets
+    for image_file in file_list:
         image_id = image_file[0]
-
         image_list.append(image_id)
         num_obj = (len(image_file) - 1) // 5
         for i in range(num_obj):
@@ -202,16 +271,65 @@ def test_evaluate(model, test_dataset_file, img_root, test_loader=None):
     print("---Evaluate model on test samples---")
     sys.stdout.flush()
     model.eval()
+
+    # Run inference on all images
     for image_path in tqdm(image_list):
-        result = predict_image(model, image_path, root_img_directory=img_root)
-        for (
-            (x1, y1),
-            (x2, y2),
-            class_name,
-            image_id,
-            prob,
-        ) in result:  # image_id is actually image_path
-            preds[class_name].append([image_id, prob, x1, y1, x2, y2])
-            preds_submission[image_id].append([class_name, prob, x1, y1, x2, y2])
+        # Load and preprocess image
+        img_full_path = os.path.join(img_root, image_path)
+        image = cv2.imread(img_full_path)
+        if image is None:
+            print(f"Warning: Could not load image {img_full_path}")
+            continue
+
+        orig_h, orig_w = image.shape[:2]
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Apply preprocessing
+        transformed = transform(image=image_rgb)
+        img_tensor = transformed['image'].unsqueeze(0)  # Add batch dimension
+
+        # Move to GPU if available
+        device = next(model.parameters()).device
+        img_tensor = img_tensor.to(device)
+
+        # Run inference
+        with torch.no_grad():
+            detections = model.inference(img_tensor)
+
+        # Process detections for this image
+        if detections[0] is not None:
+            for detection in detections[0]:
+                # Detection format: (x, y, w, h, obj_conf, class_conf, class_pred)
+                x_center = detection[0].item()
+                y_center = detection[1].item()
+                w = detection[2].item()
+                h = detection[3].item()
+                obj_conf = detection[4].item()
+                class_conf = detection[5].item()
+                class_id = int(detection[6].item())
+
+                # Convert from center format (normalized 0-1) to corner format (pixels)
+                x1 = int((x_center - w / 2) * orig_w)
+                y1 = int((y_center - h / 2) * orig_h)
+                x2 = int((x_center + w / 2) * orig_w)
+                y2 = int((y_center + h / 2) * orig_h)
+
+                # Clip to image boundaries
+                x1 = max(0, min(x1, orig_w - 1))
+                y1 = max(0, min(y1, orig_h - 1))
+                x2 = max(0, min(x2, orig_w - 1))
+                y2 = max(0, min(y2, orig_h - 1))
+
+                # Skip degenerate boxes
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                # Combined confidence score
+                prob = obj_conf * class_conf
+                class_name = VOC_CLASSES[class_id]
+
+                # Add to predictions
+                preds[class_name].append([image_path, prob, x1, y1, x2, y2])
+                preds_submission[image_path].append([class_name, prob, x1, y1, x2, y2])
 
     return preds_submission

@@ -138,7 +138,7 @@ class YOLOv3Head(nn.Module):
 # ============================================================================
 # NMS for inference
 # ============================================================================
-def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
+def non_max_suppression(prediction, conf_thres=0.3, nms_thres=0.4):
     """
     Removes detections with lower object confidence score than 'conf_thres'
     Non-Maximum Suppression to further filter detections.
@@ -146,6 +146,7 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
     Args:
         prediction: (batch_size, num_boxes, 5 + num_classes)
                    where 5 = (x, y, w, h, objectness)
+                   num_boxes = total boxes from all scales
         conf_thres: object confidence threshold
         nms_thres: IOU threshold for NMS
 
@@ -156,19 +157,25 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
     output = [None for _ in range(len(prediction))]
 
     for image_i, image_pred in enumerate(prediction):
-        # Filter out confidence scores below threshold
-        conf_mask = (image_pred[:, 4] >= conf_thres).squeeze()
-        image_pred = image_pred[conf_mask]
-
-        if not image_pred.size(0):
-            continue
-
-        # Get score and class with highest confidence
+        # Get score and class with highest confidence FIRST
         class_conf, class_pred = torch.max(image_pred[:, 5:], 1, keepdim=True)
+
+        
+        obj_conf = image_pred[:, 4]
+        combined_conf = obj_conf * class_conf.squeeze()
+
+        # Filter by COMBINED confidence (not just objectness)
+        conf_mask = (combined_conf >= conf_thres)
+        image_pred = image_pred[conf_mask]
+        class_conf = class_conf[conf_mask]
+        class_pred = class_pred[conf_mask]
+
+        if conf_mask.sum() == 0:
+            continue
 
         # Detections: (x, y, w, h, obj_conf, class_conf, class_pred)
         detections = torch.cat((image_pred[:, :5], class_conf.float(), class_pred.float()), 1)
-
+        
         # Perform NMS
         unique_labels = detections[:, -1].unique()
 
@@ -258,7 +265,24 @@ class ODModel(nn.Module):
         predictions = self.head(features)
 
         return predictions
-    def inference(self, x):
+    def inference(self, x, conf_thres=None, nms_thres=None):
+        """
+        Run inference with NMS.
+
+        Args:
+            x: Input images tensor [B, 3, H, W]
+            conf_thres: Confidence threshold (default: use model's conf_thres)
+            nms_thres: NMS IoU threshold (default: use model's nms_thres)
+
+        Returns:
+            List of detections per image, each detection: (x, y, w, h, obj_conf, class_conf, class_pred)
+        """
+        # Use model defaults if not specified
+        if conf_thres is None:
+            conf_thres = self.conf_thres
+        if nms_thres is None:
+            nms_thres = self.nms_thres
+
         self.eval()
         with torch.no_grad():
             features = self.backbone(x)
@@ -276,6 +300,7 @@ class ODModel(nn.Module):
             all_predictions = []
 
             for i in range(batch_size):
+                # Concatenate predictions from all scales
                 pred_i = torch.cat([
                     pred_13[i].view(-1, 5 + self.num_classes),
                     pred_26[i].view(-1, 5 + self.num_classes),
@@ -283,13 +308,12 @@ class ODModel(nn.Module):
                 ], dim=0)
                 all_predictions.append(pred_i)
 
-            all_predictions = torch.stack(all_predictions, dim=0)
+            all_predictions = torch.stack(all_predictions, dim=0) #will be (B, N, 5 + C)
 
-            # Apply NMS
-            output = non_max_suppression(all_predictions)
-
+            # Apply NMS with specified thresholds
+            output = non_max_suppression(all_predictions, conf_thres, nms_thres)
             return output
-    def _transform_predictions(self, pred):
+    def _transform_predictions(self, pred, anchors):
         """
         Transform raw predictions to actual bbox coordinates.
 
@@ -314,13 +338,12 @@ class ODModel(nn.Module):
         obj_conf = torch.sigmoid(pred[..., 4])  # Objectness
         cls_conf = torch.softmax(pred[..., 5:], dim=-1)  # classification scores
 
-        # Calculate offsets for each grid
         grid_x = torch.arange(grid_size, dtype=torch.float, device=pred.device).repeat(grid_size, 1).view(1, grid_size, grid_size, 1)
         grid_y = torch.arange(grid_size, dtype=torch.float, device=pred.device).repeat(grid_size, 1).t().view(1, grid_size, grid_size, 1)
 
         # Anchor dimensions
-        anchor_w = torch.tensor([a[0] for a in self.anchors], dtype=torch.float, device=pred.device).view(1, 1, 1, self.num_anchors)
-        anchor_h = torch.tensor([a[1] for a in self.anchors], dtype=torch.float, device=pred.device).view(1, 1, 1, self.num_anchors)
+        anchor_w = torch.tensor([a[0] for a in anchors], dtype=torch.float, device=pred.device).view(1, 1, 1, self.num_anchors)
+        anchor_h = torch.tensor([a[1] for a in anchors], dtype=torch.float, device=pred.device).view(1, 1, 1, self.num_anchors)
 
         # Add offset and scale with anchors
         # Clamp w and h before exp to prevent overflow (clamp to [-10, 10])
@@ -343,9 +366,6 @@ class ODModel(nn.Module):
         return output
 
 
-# ============================================================================
-# Factory function (保持與原始程式碼的相容性)
-# ============================================================================
 def resnet50(pretrained=True):
     """
     Factory function to create YOLO v3 model with DenseNet backbone.
