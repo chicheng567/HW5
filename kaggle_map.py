@@ -11,8 +11,6 @@ following the VOC2010 protocol (integral interpolation, IoU threshold 0.5),
 and returns the mean AP across the 20 Pascal VOC classes.
 """
 
-from __future__ import annotations
-
 import ast
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -58,7 +56,7 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
     ----------
     solution:
         Ground-truth dataframe supplied by Kaggle.  Must include the row id,
-        ``Usage`` flag, and ``prediction_list`` columns.
+        ``prediction_list`` columns.
     submission:
         Competitor predictions containing the row id and ``prediction_list``.
     row_id_column_name:
@@ -104,10 +102,16 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
         if ap is not None:
             aps.append(ap)
 
-    result = float(np.mean(aps) if aps else 0.0)
+    if aps:
+        result = float(np.mean(aps))
+    else:
+        result = 0.0
+
     if not np.isfinite(result):
-        raise ParticipantVisibleError("Evaluation produced a non-finite score.")
-    return float(result)
+        # Return 0.0 instead of raising exception for non-finite scores
+        result = 0.0
+
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -115,7 +119,7 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
 # --------------------------------------------------------------------------- #
 
 def _validate_columns(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: str) -> None:
-    required_solution_cols = {row_id_column_name, "Usage", "prediction_list"}
+    required_solution_cols = {row_id_column_name, "prediction_list"}
     required_submission_cols = {row_id_column_name, "prediction_list"}
 
     missing_sol = required_solution_cols.difference(solution.columns)

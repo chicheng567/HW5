@@ -9,7 +9,7 @@ import torch
 
 from src.config import VOC_CLASSES, YOLO_IMG_DIM
 from src.dataset import test_data_pipelines
-from src.yolo import resnet50
+from src.yolo import getODmodel
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_model(weights_path: Path, device: torch.device) -> torch.nn.Module:
-    model = resnet50(pretrained=False)
+    model = getODmodel(pretrained=False)
     state_dict = torch.load(weights_path, map_location=device)
     model.load_state_dict(state_dict)
     model.to(device)
