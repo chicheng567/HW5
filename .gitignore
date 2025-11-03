@@ -2,3 +2,4 @@ checkpoints/*
 VOC/*
 __pycache__/*
 AGENTS.md
+dataset

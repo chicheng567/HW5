@@ -26,10 +26,10 @@ def train():
     lambda_noobj=0.5
     lambda_class=1.0
     # Data paths
-    file_root_train = '/workspace/test_hw4/VOC/JPEGImages/'
-    annotation_file_train = 'vocall_train.txt'
-    file_root_val = '/workspace/test_hw4/VOC/JPEGImages/'
-    annotation_file_val = 'vocall_val.txt'
+    file_root_train = './dataset/image/'
+    annotation_file_train = './dataset/vocall_train.txt'
+    file_root_val = './dataset/image/'
+    annotation_file_val = './dataset/vocall_val.txt'
 
     # Create datasets
     print('Loading datasets...')
