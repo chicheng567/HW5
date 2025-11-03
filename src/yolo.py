@@ -357,7 +357,7 @@ class ODModel(nn.Module):
         return output
 
 
-def resnet50(pretrained=True):
+def getODmodel(pretrained=True):
     """
     Factory function to create YOLO v3 model with DenseNet backbone.
     Renamed to keep compatibility with existing code.

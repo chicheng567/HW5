@@ -9,7 +9,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 from torch.amp import autocast, GradScaler
-from src.yolo import resnet50
+from src.yolo import resnet50   
 from yolo_loss import YOLOv3Loss
 from src.dataset import VocDetectorDataset, train_data_pipelines, test_data_pipelines, collate_fn
 from src.eval_voc import evaluate
