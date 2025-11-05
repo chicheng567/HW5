@@ -137,6 +137,7 @@ class YOLOv3Loss(nn.Module):
 
         self.mse_loss = nn.MSELoss(reduction='none')
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
         self.focal_loss = FocalLoss(reduction='none')
         self.box_loss = BoxLoss(loss_type='giou')
         self.anchors = anchors  # List of anchor boxes per scale
@@ -186,9 +187,10 @@ class YOLOv3Loss(nn.Module):
                 ################
                 # Class loss
                 cls_loss = self.bce_loss(
-                    pred[..., 5:],
+                    pred[..., 5:],  # [B, H, W, A, C]
                     gt[..., 5:]
                 )
+                
                 total_cls_loss += cls_loss[obj_mask].sum()
 
             # Objectness loss for positive samples
